@@ -643,8 +643,8 @@ async fn process_file(
     filtering_threshold: f64,
     no_update_bloom_filter: bool,    
     annotate: bool,
-    pbar_option: &Option<Arc<Mutex<ProgressBar>>>,    
-) -> Result<(usize, usize), io::Error> {
+    pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
+) -> Result<(usize, usize)> {
 
     // Setup input/output writers
     // If input file is local: can stream pretty easily/robustly
@@ -692,52 +692,44 @@ async fn process_file(
     for line in lines {
         let line = line?;
         count += 1;
-        let (dedup_data, removed_line_bytes, total_line_bytes) = match *remove_type {
+        let res: Result<(serde_json::Value, usize, usize)> = match *remove_type {
             RemoveType::Exact => {
-                process_line_exact(&line, &bloom_filter, no_update_bloom_filter, annotate)
+                Ok(process_line_exact(&line, &bloom_filter, no_update_bloom_filter, annotate))
             }
             RemoveType::Substring => {
-                process_line_substring(&line, &bloom_filter, max_ngram_size,
-                                   no_update_bloom_filter, annotate, substr_seqlen, filtering_threshold)
+                Ok(process_line_substring(&line, &bloom_filter, max_ngram_size,
+                                   no_update_bloom_filter, annotate, substr_seqlen, filtering_threshold))
             }
             RemoveType::Both => {
-                // Dumb version: check if document should be removed
-                process_line_both(&line, &bloom_filter, min_ngram_size, max_ngram_size,
-                                  filtering_threshold, no_update_bloom_filter, annotate)
-                /*
-                let (doc_dedup, doc_removed_bytes, doc_total_bytes) = 
-                    process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
-                         &RemoveType::Document, filtering_threshold, no_update_bloom_filter, annotate);
-                if doc_removed_bytes > 0 { 
-                    (doc_dedup, doc_removed_bytes, doc_total_bytes)
-                } else { // and if document should NOT be removed, then do paragraph level
-                    process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
-                         &RemoveType::Paragraph, filtering_threshold, no_update_bloom_filter, annotate)     
-                } 
-                */
-                    
+                Ok(process_line_both(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                                  filtering_threshold, no_update_bloom_filter, annotate))
             },
             RemoveType::OldBoth => {
-                process_line_oldboth(&line, &bloom_filter, min_ngram_size, max_ngram_size,
-                                     filtering_threshold, no_update_bloom_filter, annotate)
+                Ok(process_line_oldboth(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                                     filtering_threshold, no_update_bloom_filter, annotate))
             }
 
 
             RemoveType::NaiveBoth => {
-                let (doc_dedup, doc_removed_bytes, doc_total_bytes) = 
-                    process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
-                         &RemoveType::Document, filtering_threshold, no_update_bloom_filter, annotate);
-                if doc_removed_bytes > 0 { 
-                    (doc_dedup, doc_removed_bytes, doc_total_bytes)
-                } else { // and if document should NOT be removed, then do paragraph level
-                    process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
-                         &RemoveType::Paragraph, filtering_threshold, no_update_bloom_filter, annotate)     
-                }                 
+                match process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                         &RemoveType::Document, filtering_threshold, no_update_bloom_filter, annotate) {
+                    Ok(res) => {
+                        if res.1 > 0 { Ok(res) } else {
+                            process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                                &RemoveType::Paragraph, filtering_threshold, no_update_bloom_filter, annotate)
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
             }
-            _ => { // Handles the "paragraph" and "document" case (but not "both" [for now]!)
+            _ => {
                     process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
-                         remove_type, filtering_threshold, no_update_bloom_filter, annotate)             
+                         remove_type, filtering_threshold, no_update_bloom_filter, annotate)
             }
+        };
+        let (dedup_data, removed_line_bytes, total_line_bytes) = match res {
+            Ok(v) => v,
+            Err(e) => { eprintln!("Skipping line due to error: {e}"); continue; }
         };
 
         removed_text_bytes += removed_line_bytes;
@@ -788,9 +780,9 @@ async fn process_file(
 }
 
 
-fn process_line(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize, max_ngram_size: usize,
-               remove_type: &RemoveType, filtering_threshold: f64, no_update_bloom_filter: bool, annotate: bool) ->  
-    (serde_json::Value, usize, usize) {
+fn process_line(line: &str, bloom_filter: &BloomFilter, min_ngram_size: usize, max_ngram_size: usize,
+               remove_type: &RemoveType, filtering_threshold: f64, no_update_bloom_filter: bool, annotate: bool)
+    -> Result<(serde_json::Value, usize, usize)> {
     // Main BFF logic: processes a single json document
     // Does the following (handling the {paragraph, document, both} cases)
     // 1. Breaks document into units (paragraph/both -> paragraph; document -> full text)
@@ -807,10 +799,16 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize
     // If annotate is turned on, nothing gets removed, text is left intact, but byte-windows-removed
 
 
-    let mut data: Value = serde_json::from_str(&line).unwrap();
+    let mut data: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return Err(anyhow!("JSON parse error: {e}")),
+    };
+    let text = match data.get("text").and_then(Value::as_str) {
+        Some(t) => t,
+        None => return Err(anyhow!("missing text field")),
+    };
     let mut total_bytes = 0;
     let mut removed_bytes = 0;
-    let text = data["text"].as_str().unwrap();
 
     // Step 1: Break text into "units"
     let newlines = if *remove_type == RemoveType::Document {
@@ -894,7 +892,7 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize
         data["text"] = Value::String(output_paragraphs);
     }
 
-    (data, removed_bytes, total_bytes)
+    Ok((data, removed_bytes, total_bytes))
 }
 
 

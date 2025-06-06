@@ -29,9 +29,18 @@ cargo run --release bff \
    --max-ngram-size 13 \
    --filtering-threshold 0.8 \
    --remove-type old-both \
-   --annotate 
+   --annotate
 ```
 
+Input format
+------------
+BFF expects newline-delimited JSON files with a `"text"` field. Files may be
+compressed using gzip (`.jsonl.gz`) or zstd (`.jsonl.zst`/`.jsonl.zstd`). Example
+line:
+
+```json
+{"text": "example document"}
+```
 
 Usage Notes
 --------
